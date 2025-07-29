@@ -1,6 +1,6 @@
 # go-rabbitmq
 
-A fork from https://github.com/wagslane/go-rabbitmq and modified for axionhq usage.
+A fork from https://github.com/wagslane/go-rabbitmq and modified for personal use case.
 
 Below is description from `wagslane/go-rabbitmq`
 
