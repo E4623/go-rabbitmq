@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	rabbitmq "github.com/axionhq/go-rabbitmq"
+	rabbitmq "github.com/e4623/go-rabbitmq"
 )
 
 func main() {

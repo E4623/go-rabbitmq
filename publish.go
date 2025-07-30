@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/axionhq/go-rabbitmq/internal/channelmanager"
-	"github.com/axionhq/go-rabbitmq/internal/connectionmanager"
+	"github.com/e4623/go-rabbitmq/internal/channelmanager"
+	"github.com/e4623/go-rabbitmq/internal/connectionmanager"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 

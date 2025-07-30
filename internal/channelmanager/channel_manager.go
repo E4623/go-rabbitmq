@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/axionhq/go-rabbitmq/internal/connectionmanager"
-	"github.com/axionhq/go-rabbitmq/internal/dispatcher"
-	"github.com/axionhq/go-rabbitmq/internal/logger"
+	"github.com/e4623/go-rabbitmq/internal/connectionmanager"
+	"github.com/e4623/go-rabbitmq/internal/dispatcher"
+	"github.com/e4623/go-rabbitmq/internal/logger"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 

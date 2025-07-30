@@ -1,4 +1,4 @@
-module github.com/axionhq/go-rabbitmq
+module github.com/e4623/go-rabbitmq
 
 go 1.22.6
 
