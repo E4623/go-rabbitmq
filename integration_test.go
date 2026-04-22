@@ -20,10 +20,10 @@ func prepareDockerTest(t *testing.T) (connStr string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "docker", "run", "--rm", "--detach", "--publish=5672:5672", "--quiet", "--", "rabbitmq:4.1.1-alpine").Output()
+	out, err := exec.CommandContext(ctx, "docker", "run", "--rm", "--detach", "--publish=5672:5672", "--", "rabbitmq:4.1.1-alpine").CombinedOutput()
 	if err != nil {
 		t.Log("container id", string(out))
-		t.Fatalf("error launching rabbitmq in docker: %v", err)
+		t.Fatalf("error launching rabbitmq in docker: %v\noutput: %s", err, out)
 	}
 	t.Cleanup(func() {
 		containerId := strings.TrimSpace(string(out))

@@ -12,6 +12,13 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// errConnectionManagerClosed signals reconnectLoop that the caller has
+// closed the manager and the loop must terminate rather than keep dialing
+// fresh connections — otherwise a reconnect that wins the race against
+// Close() would leave a live zombie connection (and any channels rebuilt
+// on it) outliving the user's shutdown request.
+var errConnectionManagerClosed = errors.New("connection manager closed")
+
 // ConnectionManager -
 type ConnectionManager struct {
 	logger              logger.Logger
@@ -24,6 +31,7 @@ type ConnectionManager struct {
 	reconnectionCountMu *sync.Mutex
 	dispatcher          *dispatcher.Dispatcher
 	preConnectionFunc   func() // used for reconnection, this is a func will always be called before making connection to AMQP, this value should never be nil because when pass a nil func will automatically create an empty func
+	isClosed            bool   // protected by connectionMu
 }
 
 type Resolver interface {
@@ -91,6 +99,8 @@ func (connManager *ConnectionManager) Close() error {
 	connManager.connectionMu.Lock()
 	defer connManager.connectionMu.Unlock()
 
+	connManager.isClosed = true
+
 	err := connManager.connection.Close()
 	if err != nil {
 		return err
@@ -120,12 +130,34 @@ func (connManager *ConnectionManager) CheckinConnection() {
 // Once reconnected, it sends an error back on the manager's notifyCancelOrClose
 // channel
 func (connManager *ConnectionManager) startNotifyClose() {
-	notifyCloseChan := connManager.connection.NotifyClose(make(chan *amqp.Error, 1))
+	connManager.connectionMu.RLock()
+	conn := connManager.connection
+	connManager.connectionMu.RUnlock()
+
+	notifyCloseChan := conn.NotifyClose(make(chan *amqp.Error, 1))
+
+	// Guard against the race where conn died between reconnect() swapping
+	// it in and us registering NotifyClose above. amqp091-go's NotifyClose
+	// closes the passed chan silently when the connection is already closed
+	// (noNotify branch), so we would read nil from notifyCloseChan, log
+	// "closed gracefully", and exit — leaving the library with no active
+	// supervisor on the connection and all ChannelManagers retrying forever.
+	if conn.IsClosed() {
+		connManager.logger.Errorf("connection observed closed immediately after reconnect, re-reconnecting")
+		if loopErr := connManager.reconnectLoop(); loopErr != nil {
+			return
+		}
+		connManager.logger.Warnf("successfully reconnected to amqp server")
+		connManager.dispatcher.Dispatch(amqp.ErrClosed)
+		return
+	}
 
 	err := <-notifyCloseChan
 	if err != nil {
 		connManager.logger.Errorf("attempting to reconnect to amqp server after connection close with error: %v", err)
-		connManager.reconnectLoop()
+		if loopErr := connManager.reconnectLoop(); loopErr != nil {
+			return
+		}
 		connManager.logger.Warnf("successfully reconnected to amqp server")
 		connManager.dispatcher.Dispatch(err)
 	}
@@ -147,19 +179,26 @@ func (connManager *ConnectionManager) incrementReconnectionCount() {
 	connManager.reconnectionCount++
 }
 
-// reconnectLoop continuously attempts to reconnect
-func (connManager *ConnectionManager) reconnectLoop() {
+// reconnectLoop continuously attempts to reconnect. It returns nil on a
+// successful rebuild or errConnectionManagerClosed if the manager was closed
+// while the loop was running — callers must not dispatch a reconnect signal
+// in the latter case, since no new connection exists.
+func (connManager *ConnectionManager) reconnectLoop() error {
 	for {
 		connManager.logger.Infof("waiting %s seconds to attempt to reconnect to amqp server", connManager.ReconnectInterval)
 		time.Sleep(connManager.ReconnectInterval)
 		err := connManager.reconnect()
+		if errors.Is(err, errConnectionManagerClosed) {
+			connManager.logger.Infof("connection manager closed, abandoning reconnect loop")
+			return err
+		}
 		if err != nil {
 			connManager.logger.Errorf("error reconnecting to amqp server: %v", err)
-		} else {
-			connManager.incrementReconnectionCount()
-			go connManager.startNotifyClose()
-			return
+			continue
 		}
+		connManager.incrementReconnectionCount()
+		go connManager.startNotifyClose()
+		return nil
 	}
 }
 
@@ -167,6 +206,13 @@ func (connManager *ConnectionManager) reconnectLoop() {
 func (connManager *ConnectionManager) reconnect() error {
 	connManager.connectionMu.Lock()
 	defer connManager.connectionMu.Unlock()
+
+	// The caller closed us while we were sleeping in reconnectLoop. Do not
+	// dial a fresh connection — otherwise the new connection (and any
+	// channels rebuilt on it) would outlive the user's shutdown request.
+	if connManager.isClosed {
+		return errConnectionManagerClosed
+	}
 
 	connManager.preConnectionFunc()
 	conn, err := dial(connManager.logger, connManager.resolver, amqp.Config(connManager.amqpConfig))
@@ -188,4 +234,16 @@ func (connManager *ConnectionManager) IsClosed() bool {
 	defer connManager.connectionMu.Unlock()
 
 	return connManager.connection.IsClosed()
+}
+
+// IsManagerClosed reports whether the caller has closed the ConnectionManager
+// itself (as opposed to the underlying amqp connection being dead but
+// recoverable). ChannelManagers consult this to distinguish "connection
+// down, keep retrying" from "manager shut down, abandon reconnect loop" —
+// otherwise a user-initiated Conn.Close while a channel's reconnectLoop is
+// sleeping would leave that loop retrying forever.
+func (connManager *ConnectionManager) IsManagerClosed() bool {
+	connManager.connectionMu.RLock()
+	defer connManager.connectionMu.RUnlock()
+	return connManager.isClosed
 }

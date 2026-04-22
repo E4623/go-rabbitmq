@@ -58,6 +58,13 @@ type Publisher struct {
 	notifyPublishHandler func(p Confirmation)
 
 	options PublisherOptions
+
+	// notifyHandlerWG tracks the flow and blocked notification handlers so
+	// each reconnect can wait for the previous pair to exit before spawning
+	// fresh ones — prevents transient goroutine doubling on reconnect.
+	notifyHandlerWG sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 type PublisherConfirmation []*amqp.DeferredConfirmation
@@ -132,8 +139,20 @@ func (publisher *Publisher) startup() error {
 	if err != nil {
 		return fmt.Errorf("declare exchange failed: %w", err)
 	}
-	go publisher.startNotifyFlowHandler()
-	go publisher.startNotifyBlockedHandler()
+	// Wait for any previous handler pair to exit before spawning fresh ones
+	// so we never have two flow (or two blocked) handlers racing on the same
+	// flag. Prior handlers exit when their channel/connection closes, which
+	// already happened as part of the reconnect that led us here.
+	publisher.notifyHandlerWG.Wait()
+	publisher.notifyHandlerWG.Add(2)
+	go func() {
+		defer publisher.notifyHandlerWG.Done()
+		publisher.startNotifyFlowHandler()
+	}()
+	go func() {
+		defer publisher.notifyHandlerWG.Done()
+		publisher.startNotifyBlockedHandler()
+	}()
 	return nil
 }
 
@@ -277,18 +296,20 @@ func (publisher *Publisher) PublishWithDeferredConfirmWithContext(
 
 // Close closes the publisher and releases resources
 // The publisher should be discarded as it's not safe for re-use
-// Only call Close() once
+// Safe to call multiple times; subsequent calls are no-ops.
 func (publisher *Publisher) Close() {
-	// close the channel so that rabbitmq server knows that the
-	// publisher has been stopped.
-	err := publisher.chanManager.Close()
-	if err != nil {
-		publisher.options.Logger.Warnf("error while closing the channel: %v", err)
-	}
-	publisher.options.Logger.Infof("closing publisher...")
-	go func() {
-		publisher.closeConnectionToManagerCh <- struct{}{}
-	}()
+	publisher.closeOnce.Do(func() {
+		// close the channel so that rabbitmq server knows that the
+		// publisher has been stopped.
+		err := publisher.chanManager.Close()
+		if err != nil {
+			publisher.options.Logger.Warnf("error while closing the channel: %v", err)
+		}
+		publisher.options.Logger.Infof("closing publisher...")
+		go func() {
+			publisher.closeConnectionToManagerCh <- struct{}{}
+		}()
+	})
 }
 
 // NotifyReturn registers a listener for basic.return methods.

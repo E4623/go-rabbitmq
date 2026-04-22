@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"math/rand"
+	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -16,6 +17,9 @@ type Conn struct {
 	closeConnectionToManagerCh chan<- struct{}
 
 	options ConnectionOptions
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Config wraps amqp.Config
@@ -83,10 +87,15 @@ func (conn *Conn) handleRestarts() {
 
 // Close closes the connection, it's not safe for re-use.
 // You should also close any consumers and publishers before
-// closing the connection
+// closing the connection.
+// Safe to call multiple times; subsequent calls return the result of the
+// first close.
 func (conn *Conn) Close() error {
-	conn.closeConnectionToManagerCh <- struct{}{}
-	return conn.connectionManager.Close()
+	conn.closeOnce.Do(func() {
+		conn.closeConnectionToManagerCh <- struct{}{}
+		conn.closeErr = conn.connectionManager.Close()
+	})
+	return conn.closeErr
 }
 
 // IsClosed returns whether the connection is closed or not

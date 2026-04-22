@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/e4623/go-rabbitmq/internal/channelmanager"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -37,6 +38,13 @@ type Consumer struct {
 
 	isClosedMu *sync.RWMutex
 	isClosed   bool
+	// closedAtomic is set by Close before acquiring any lock so that an
+	// in-flight reconnect dispatch racing us to startGoroutines can observe
+	// the shutdown signal without blocking behind cleanupResources's lock
+	// hold. Eliminates most of the window where a consumer could briefly
+	// register on the broker after Close was called.
+	closedAtomic atomic.Bool
+	closeOnce    sync.Once
 }
 
 // Delivery captures the fields for a previously delivered message resident in
@@ -120,18 +128,24 @@ func (consumer *Consumer) Run(handler Handler) error {
 // Use CloseWithContext to specify a context to cancel the handler completion.
 // It does not close the connection manager, just the subscription
 // to the connection manager and the consuming goroutines.
-// Only call once.
+// Safe to call multiple times; subsequent calls are no-ops.
 func (consumer *Consumer) Close() {
-	if consumer.options.CloseGracefully {
-		consumer.options.Logger.Infof("waiting for handler to finish...")
-		err := consumer.waitForHandlerCompletion(context.Background())
-		if err != nil {
-			consumer.options.Logger.Warnf("error while waiting for handler to finish: %v", err)
+	consumer.closeOnce.Do(func() {
+		// Signal shutdown before any lock is held so a racing
+		// reconnect-driven startGoroutines sees it on entry and bails
+		// without registering a new consumer on the broker.
+		consumer.closedAtomic.Store(true)
+
+		if consumer.options.CloseGracefully {
+			consumer.options.Logger.Infof("waiting for handler to finish...")
+			err := consumer.waitForHandlerCompletion(context.Background())
+			if err != nil {
+				consumer.options.Logger.Warnf("error while waiting for handler to finish: %v", err)
+			}
 		}
-	}
 
-	consumer.cleanupResources()
-
+		consumer.cleanupResources()
+	})
 }
 
 func (consumer *Consumer) cleanupResources() {
@@ -157,16 +171,21 @@ func (consumer *Consumer) cleanupResources() {
 // Use the context to cancel the handler completion.
 // CloseWithContext does not close the connection manager, just the subscription
 // to the connection manager and the consuming goroutines.
-// Only call once.
+// Safe to call multiple times; subsequent calls are no-ops.
 func (consumer *Consumer) CloseWithContext(ctx context.Context) {
-	if consumer.options.CloseGracefully {
-		err := consumer.waitForHandlerCompletion(ctx)
-		if err != nil {
-			consumer.options.Logger.Warnf("error while waiting for handler to finish: %v", err)
-		}
-	}
+	consumer.closeOnce.Do(func() {
+		// Signal shutdown before any lock is held (see Close for rationale).
+		consumer.closedAtomic.Store(true)
 
-	consumer.cleanupResources()
+		if consumer.options.CloseGracefully {
+			err := consumer.waitForHandlerCompletion(ctx)
+			if err != nil {
+				consumer.options.Logger.Warnf("error while waiting for handler to finish: %v", err)
+			}
+		}
+
+		consumer.cleanupResources()
+	})
 }
 
 // startGoroutines declares the queue if it doesn't exist,
@@ -176,8 +195,19 @@ func (consumer *Consumer) startGoroutines(
 	handler Handler,
 	options ConsumerOptions,
 ) error {
+	// Fast path: check the atomic shutdown signal before waiting on any
+	// lock. Close sets this before acquiring isClosedMu, so a racing
+	// reconnect-dispatch that lands here can exit immediately.
+	if consumer.closedAtomic.Load() {
+		return nil
+	}
 	consumer.isClosedMu.Lock()
 	defer consumer.isClosedMu.Unlock()
+	// Re-check under lock in case Close set the flag between our atomic
+	// check above and us acquiring the lock.
+	if consumer.isClosed || consumer.closedAtomic.Load() {
+		return nil
+	}
 	err := consumer.chanManager.QosSafe(
 		options.QOSPrefetch,
 		0,
