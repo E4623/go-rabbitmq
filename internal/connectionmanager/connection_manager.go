@@ -19,19 +19,41 @@ import (
 // on it) outliving the user's shutdown request.
 var errConnectionManagerClosed = errors.New("connection manager closed")
 
+// ErrReconnectAttemptsExhausted is returned to NotifyReconnect subscribers
+// when MaxReconnectAttempts > 0 and the loop has exhausted retries without
+// success. The dispatcher is then shut down so subscribers exit cleanly.
+var ErrReconnectAttemptsExhausted = errors.New("reconnect attempts exhausted")
+
+// Options bundles the configuration for a ConnectionManager. Internal
+// constructor parameters were getting unwieldy; this struct keeps them
+// named and lets callers leave optional hooks zero.
+type Options struct {
+	Resolver             Resolver
+	AmqpConfig           amqp.Config
+	Logger               logger.Logger
+	ReconnectInterval    time.Duration
+	Backoff              func(attempt int) time.Duration // nil = use ReconnectInterval (fixed)
+	MaxReconnectAttempts int                             // 0 = unbounded
+	PreConnectionFunc    func()                          // nil = noop
+	OnConnectionLost     func(err error)                 // nil = no-op
+}
+
 // ConnectionManager -
 type ConnectionManager struct {
-	logger              logger.Logger
-	resolver            Resolver
-	connection          *amqp.Connection
-	amqpConfig          amqp.Config
-	connectionMu        *sync.RWMutex
-	ReconnectInterval   time.Duration
-	reconnectionCount   uint
-	reconnectionCountMu *sync.Mutex
-	dispatcher          *dispatcher.Dispatcher
-	preConnectionFunc   func() // used for reconnection, this is a func will always be called before making connection to AMQP, this value should never be nil because when pass a nil func will automatically create an empty func
-	isClosed            bool   // protected by connectionMu
+	logger               logger.Logger
+	resolver             Resolver
+	connection           *amqp.Connection
+	amqpConfig           amqp.Config
+	connectionMu         *sync.RWMutex
+	ReconnectInterval    time.Duration
+	backoff              func(attempt int) time.Duration
+	maxReconnectAttempts int
+	reconnectionCount    uint
+	reconnectionCountMu  *sync.Mutex
+	dispatcher           *dispatcher.Dispatcher
+	preConnectionFunc    func()           // never nil — defaulted to a no-op when empty
+	onConnectionLost     func(err error)  // may be nil
+	isClosed             bool             // protected by connectionMu
 }
 
 type Resolver interface {
@@ -63,34 +85,44 @@ func maskPassword(urlToMask string) string {
 	return parsedUrl.Redacted()
 }
 
-// NewConnectionManager creates a new connection manager
-func NewConnectionManager(resolver Resolver, conf amqp.Config, log logger.Logger, reconnectInterval time.Duration, preConnectionFunc func()) (*ConnectionManager, error) {
-
-	if preConnectionFunc == nil { // check if preConnectionFunc pass nil value, create an empty func as default
-		// should NEVER reach here because we load the default
-		preConnectionFunc = func() {}
+// NewConnectionManager creates a new connection manager.
+func NewConnectionManager(opts Options) (*ConnectionManager, error) {
+	if opts.PreConnectionFunc == nil {
+		opts.PreConnectionFunc = func() {}
 	}
 
-	preConnectionFunc()
-	conn, err := dial(log, resolver, amqp.Config(conf))
+	opts.PreConnectionFunc()
+	conn, err := dial(opts.Logger, opts.Resolver, opts.AmqpConfig)
 	if err != nil {
 		return nil, err
 	}
 
 	connManager := ConnectionManager{
-		logger:              log,
-		resolver:            resolver,
-		connection:          conn,
-		amqpConfig:          conf,
-		connectionMu:        &sync.RWMutex{},
-		ReconnectInterval:   reconnectInterval,
-		reconnectionCount:   0,
-		reconnectionCountMu: &sync.Mutex{},
-		dispatcher:          dispatcher.NewDispatcher(),
-		preConnectionFunc:   preConnectionFunc,
+		logger:               opts.Logger,
+		resolver:             opts.Resolver,
+		connection:           conn,
+		amqpConfig:           opts.AmqpConfig,
+		connectionMu:         &sync.RWMutex{},
+		ReconnectInterval:    opts.ReconnectInterval,
+		backoff:              opts.Backoff,
+		maxReconnectAttempts: opts.MaxReconnectAttempts,
+		reconnectionCount:    0,
+		reconnectionCountMu:  &sync.Mutex{},
+		dispatcher:           dispatcher.NewDispatcher(),
+		preConnectionFunc:    opts.PreConnectionFunc,
+		onConnectionLost:     opts.OnConnectionLost,
 	}
 	go connManager.startNotifyClose()
 	return &connManager, nil
+}
+
+// nextBackoff returns the delay before retry attempt `attempt` (1-based).
+// Falls back to ReconnectInterval when no Backoff function was provided.
+func (connManager *ConnectionManager) nextBackoff(attempt int) time.Duration {
+	if connManager.backoff != nil {
+		return connManager.backoff(attempt)
+	}
+	return connManager.ReconnectInterval
 }
 
 // Close safely closes the current channel and connection
@@ -144,6 +176,9 @@ func (connManager *ConnectionManager) startNotifyClose() {
 	// supervisor on the connection and all ChannelManagers retrying forever.
 	if conn.IsClosed() {
 		connManager.logger.Errorf("connection observed closed immediately after reconnect, re-reconnecting")
+		if connManager.onConnectionLost != nil {
+			connManager.onConnectionLost(amqp.ErrClosed)
+		}
 		if loopErr := connManager.reconnectLoop(); loopErr != nil {
 			return
 		}
@@ -155,6 +190,9 @@ func (connManager *ConnectionManager) startNotifyClose() {
 	err := <-notifyCloseChan
 	if err != nil {
 		connManager.logger.Errorf("attempting to reconnect to amqp server after connection close with error: %v", err)
+		if connManager.onConnectionLost != nil {
+			connManager.onConnectionLost(err)
+		}
 		if loopErr := connManager.reconnectLoop(); loopErr != nil {
 			return
 		}
@@ -179,26 +217,40 @@ func (connManager *ConnectionManager) incrementReconnectionCount() {
 	connManager.reconnectionCount++
 }
 
-// reconnectLoop continuously attempts to reconnect. It returns nil on a
-// successful rebuild or errConnectionManagerClosed if the manager was closed
-// while the loop was running — callers must not dispatch a reconnect signal
-// in the latter case, since no new connection exists.
+// reconnectLoop continuously attempts to reconnect. Returns nil on success,
+// errConnectionManagerClosed if the manager was closed mid-loop, or
+// ErrReconnectAttemptsExhausted if MaxReconnectAttempts was set and reached
+// without a successful reconnect. Callers must not dispatch a reconnect
+// signal on terminal errors — no new connection exists.
 func (connManager *ConnectionManager) reconnectLoop() error {
-	for {
-		connManager.logger.Infof("waiting %s seconds to attempt to reconnect to amqp server", connManager.ReconnectInterval)
-		time.Sleep(connManager.ReconnectInterval)
+	for attempt := 1; ; attempt++ {
+		delay := connManager.nextBackoff(attempt)
+		connManager.logger.Infof("waiting %s before reconnect attempt %d", delay, attempt)
+		time.Sleep(delay)
+
 		err := connManager.reconnect()
 		if errors.Is(err, errConnectionManagerClosed) {
 			connManager.logger.Infof("connection manager closed, abandoning reconnect loop")
 			return err
 		}
-		if err != nil {
-			connManager.logger.Errorf("error reconnecting to amqp server: %v", err)
-			continue
+		if err == nil {
+			connManager.incrementReconnectionCount()
+			go connManager.startNotifyClose()
+			return nil
 		}
-		connManager.incrementReconnectionCount()
-		go connManager.startNotifyClose()
-		return nil
+
+		connManager.logger.Errorf("error reconnecting to amqp server (attempt %d): %v", attempt, err)
+		if connManager.maxReconnectAttempts > 0 && attempt >= connManager.maxReconnectAttempts {
+			connManager.logger.Errorf("exhausted %d reconnect attempts, giving up", connManager.maxReconnectAttempts)
+			// Mark closed so children (ChannelManagers) see IsManagerClosed
+			// and abandon their own loops, then shut down subscribers so
+			// owners blocked on reconnectErrCh exit.
+			connManager.connectionMu.Lock()
+			connManager.isClosed = true
+			connManager.connectionMu.Unlock()
+			connManager.dispatcher.Shutdown()
+			return ErrReconnectAttemptsExhausted
+		}
 	}
 }
 

@@ -70,7 +70,12 @@ func NewConsumer(
 		return nil, errors.New("connection manager can't be nil")
 	}
 
-	chanManager, err := channelmanager.NewChannelManager(conn.connectionManager, options.Logger, conn.connectionManager.ReconnectInterval)
+	chanManager, err := channelmanager.NewChannelManager(conn.connectionManager, channelmanager.Options{
+		Logger:            options.Logger,
+		ReconnectInterval: conn.connectionManager.ReconnectInterval,
+		Backoff:           conn.options.Backoff,
+		OnChannelLost:     options.OnChannelLost,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -110,12 +115,18 @@ func (consumer *Consumer) Run(handler Handler) error {
 
 	for err := range consumer.reconnectErrCh {
 		consumer.options.Logger.Infof("successful consumer recovery from: %v", err)
-		err = consumer.startGoroutines(
+		startErr := consumer.startGoroutines(
 			handlerWrapper,
 			consumer.options,
 		)
-		if err != nil {
-			return fmt.Errorf("error restarting consumer goroutines after cancel or close: %w", err)
+		if startErr != nil {
+			return fmt.Errorf("error restarting consumer goroutines after cancel or close: %w", startErr)
+		}
+		// Fire OnReconnect synchronously after the consumer is fully
+		// re-registered. Spawn a goroutine inside the callback if
+		// non-blocking semantics are desired.
+		if consumer.options.OnReconnect != nil {
+			consumer.options.OnReconnect(err)
 		}
 	}
 
@@ -163,6 +174,13 @@ func (consumer *Consumer) cleanupResources() {
 	go func() {
 		consumer.closeConnectionToManagerCh <- struct{}{}
 	}()
+}
+
+// ReconnectionCount returns how many times this consumer's channel has
+// successfully reconnected. A growing value indicates broker or network
+// instability. Useful for metrics and health checks.
+func (consumer *Consumer) ReconnectionCount() uint {
+	return consumer.chanManager.GetReconnectionCount()
 }
 
 // CloseWithContext cleans up resources and closes the consumer.

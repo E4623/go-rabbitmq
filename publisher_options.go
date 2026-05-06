@@ -8,6 +8,16 @@ type PublisherOptions struct {
 	ExchangeOptions ExchangeOptions
 	Logger          Logger
 	ConfirmMode     bool
+	// OnReconnect, if non-nil, is called synchronously after the publisher
+	// has been rebuilt on a fresh channel (exchange re-declared, return /
+	// publish / flow / blocked handlers re-attached, confirm mode restored
+	// when applicable). The argument is the error that triggered the
+	// reconnect. Fires exactly once per successful reconnect. Spawn a
+	// goroutine inside the callback for non-blocking work.
+	OnReconnect func(err error)
+	// OnChannelLost, if non-nil, is called synchronously the moment the
+	// publisher's channel is observed dead, before any reconnect begins.
+	OnChannelLost func(err error)
 }
 
 // getDefaultPublisherOptions describes the options that will be used when a value isn't provided
@@ -26,6 +36,7 @@ func getDefaultPublisherOptions() PublisherOptions {
 		},
 		Logger:      stdDebugLogger{},
 		ConfirmMode: false,
+		OnReconnect: nil,
 	}
 }
 
@@ -98,4 +109,24 @@ func WithPublisherOptionsExchangeArgs(args Table) func(*PublisherOptions) {
 // this is required if publisher confirmations should be used
 func WithPublisherOptionsConfirm(options *PublisherOptions) {
 	options.ConfirmMode = true
+}
+
+// WithPublisherOptionsOnReconnect registers a callback that fires
+// synchronously after the publisher has been rebuilt on a fresh channel.
+// The argument is the error that triggered the reconnect. Fires exactly
+// once per successful reconnect. To run work asynchronously, spawn a
+// goroutine inside the callback.
+func WithPublisherOptionsOnReconnect(fn func(err error)) func(*PublisherOptions) {
+	return func(options *PublisherOptions) {
+		options.OnReconnect = fn
+	}
+}
+
+// WithPublisherOptionsOnChannelLost registers a callback that fires
+// synchronously the moment the publisher's channel is observed dead,
+// before any reconnect begins.
+func WithPublisherOptionsOnChannelLost(fn func(err error)) func(*PublisherOptions) {
+	return func(options *PublisherOptions) {
+		options.OnChannelLost = fn
+	}
 }

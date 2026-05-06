@@ -85,7 +85,12 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 		return nil, errors.New("connection manager can't be nil")
 	}
 
-	chanManager, err := channelmanager.NewChannelManager(conn.connectionManager, options.Logger, conn.connectionManager.ReconnectInterval)
+	chanManager, err := channelmanager.NewChannelManager(conn.connectionManager, channelmanager.Options{
+		Logger:            options.Logger,
+		ReconnectInterval: conn.connectionManager.ReconnectInterval,
+		Backoff:           conn.options.Backoff,
+		OnChannelLost:     options.OnChannelLost,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -120,14 +125,20 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 	go func() {
 		for err := range publisher.reconnectErrCh {
 			publisher.options.Logger.Infof("successful publisher recovery from: %v", err)
-			err := publisher.startup()
-			if err != nil {
-				publisher.options.Logger.Fatalf("error on startup for publisher after cancel or close: %v", err)
+			startupErr := publisher.startup()
+			if startupErr != nil {
+				publisher.options.Logger.Fatalf("error on startup for publisher after cancel or close: %v", startupErr)
 				publisher.options.Logger.Fatalf("publisher closing, unable to recover")
 				return
 			}
 			publisher.startReturnHandler()
 			publisher.startPublishHandler()
+			// Fire OnReconnect synchronously after the publisher is fully
+			// rebuilt. Spawn a goroutine inside the callback for
+			// non-blocking work.
+			if publisher.options.OnReconnect != nil {
+				publisher.options.OnReconnect(err)
+			}
 		}
 	}()
 
@@ -292,6 +303,14 @@ func (publisher *Publisher) PublishWithDeferredConfirmWithContext(
 		deferredConfirmations = append(deferredConfirmations, conf)
 	}
 	return deferredConfirmations, nil
+}
+
+// ReconnectionCount returns how many times this publisher's channel has
+// successfully reconnected. Useful for metrics — also matches the
+// ReconnectionCount stamped on Confirmation values returned via
+// NotifyPublish.
+func (publisher *Publisher) ReconnectionCount() uint {
+	return publisher.chanManager.GetReconnectionCount()
 }
 
 // Close closes the publisher and releases resources

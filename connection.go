@@ -64,7 +64,16 @@ func NewClusterConn(resolver Resolver, opts ...func(*ConnectionOptions)) (*Conn,
 		optFn(options)
 	}
 
-	manager, err := connectionmanager.NewConnectionManager(resolver, amqp.Config(options.Config), options.Logger, options.ReconnectInterval, options.PreConnectionFunc)
+	manager, err := connectionmanager.NewConnectionManager(connectionmanager.Options{
+		Resolver:             resolver,
+		AmqpConfig:           amqp.Config(options.Config),
+		Logger:               options.Logger,
+		ReconnectInterval:    options.ReconnectInterval,
+		Backoff:              options.Backoff,
+		MaxReconnectAttempts: options.MaxReconnectAttempts,
+		PreConnectionFunc:    options.PreConnectionFunc,
+		OnConnectionLost:     options.OnConnectionLost,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +91,9 @@ func NewClusterConn(resolver Resolver, opts ...func(*ConnectionOptions)) (*Conn,
 func (conn *Conn) handleRestarts() {
 	for err := range conn.reconnectErrCh {
 		conn.options.Logger.Infof("successful connection recovery from: %v", err)
+		if conn.options.OnReconnect != nil {
+			conn.options.OnReconnect(err)
+		}
 	}
 }
 
@@ -101,4 +113,11 @@ func (conn *Conn) Close() error {
 // IsClosed returns whether the connection is closed or not
 func (conn *Conn) IsClosed() bool {
 	return conn.connectionManager.IsClosed()
+}
+
+// ReconnectionCount returns how many times this connection has successfully
+// reconnected to the broker since it was created. Useful for metrics or
+// debugging connection stability.
+func (conn *Conn) ReconnectionCount() uint {
+	return conn.connectionManager.GetReconnectionCount()
 }

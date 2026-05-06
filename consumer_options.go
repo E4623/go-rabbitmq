@@ -73,6 +73,20 @@ type ConsumerOptions struct {
 	Logger                logger.Logger
 	QOSPrefetch           int
 	QOSGlobal             bool
+	// OnReconnect, if non-nil, is called synchronously after the consumer
+	// has been re-registered with the broker on a fresh channel. The
+	// argument is the error that triggered the reconnect cycle. Fires
+	// exactly once per successful reconnect. Use this to take a snapshot,
+	// reconcile state, or replay missed messages from another source.
+	// Spawn a goroutine inside the callback if you need non-blocking
+	// behavior — otherwise the next message-processing iteration is
+	// gated on this returning.
+	OnReconnect func(err error)
+	// OnChannelLost, if non-nil, is called synchronously the moment the
+	// consumer's channel is observed dead, before any reconnect begins.
+	// Useful for fast alerting, marking metrics, or pausing upstream
+	// pipelines that feed into this consumer.
+	OnChannelLost func(err error)
 }
 
 // RabbitConsumerOptions are used to configure the consumer
@@ -330,6 +344,26 @@ func WithConsumerOptionsQueueQuorum(options *ConsumerOptions) {
 	}
 
 	options.QueueOptions.Args["x-queue-type"] = "quorum"
+}
+
+// WithConsumerOptionsOnReconnect registers a callback that fires
+// synchronously after the consumer has been re-registered with the broker
+// on a fresh channel. The argument is the error that triggered the
+// reconnect. Fires exactly once per successful reconnect. To run work
+// asynchronously, spawn a goroutine inside the callback.
+func WithConsumerOptionsOnReconnect(fn func(err error)) func(*ConsumerOptions) {
+	return func(options *ConsumerOptions) {
+		options.OnReconnect = fn
+	}
+}
+
+// WithConsumerOptionsOnChannelLost registers a callback that fires
+// synchronously the moment the consumer's channel is observed dead,
+// before any reconnect begins. Useful for fast alerting and metrics.
+func WithConsumerOptionsOnChannelLost(fn func(err error)) func(*ConsumerOptions) {
+	return func(options *ConsumerOptions) {
+		options.OnChannelLost = fn
+	}
 }
 
 // WithConsumerOptionsQueueMessageExpiration sets the message expiration (TTL) for all messages in the queue.

@@ -25,6 +25,15 @@ var errChannelManagerClosed = errors.New("channel manager closed")
 // publisher/consumer on channelMu.RLock for that duration.
 const livenessProbeTimeout = 10 * time.Second
 
+// Options bundles ChannelManager configuration. Optional fields default to
+// nil/0 — the manager treats those as "use sensible defaults".
+type Options struct {
+	Logger            logger.Logger
+	ReconnectInterval time.Duration
+	Backoff           func(attempt int) time.Duration // nil = use ReconnectInterval (fixed)
+	OnChannelLost     func(err error)                 // nil = no-op
+}
+
 // ChannelManager -
 type ChannelManager struct {
 	logger              logger.Logger
@@ -32,31 +41,43 @@ type ChannelManager struct {
 	connManager         *connectionmanager.ConnectionManager
 	channelMu           *sync.RWMutex
 	reconnectInterval   time.Duration
+	backoff             func(attempt int) time.Duration
 	reconnectionCount   uint
 	reconnectionCountMu *sync.Mutex
 	dispatcher          *dispatcher.Dispatcher
+	onChannelLost       func(err error)
 	isClosed            bool // protected by channelMu
 }
 
-// NewChannelManager creates a new connection manager
-func NewChannelManager(connManager *connectionmanager.ConnectionManager, log logger.Logger, reconnectInterval time.Duration) (*ChannelManager, error) {
+// NewChannelManager creates a new channel manager.
+func NewChannelManager(connManager *connectionmanager.ConnectionManager, opts Options) (*ChannelManager, error) {
 	ch, err := getNewChannel(connManager)
 	if err != nil {
 		return nil, err
 	}
 
 	chanManager := ChannelManager{
-		logger:              log,
+		logger:              opts.Logger,
 		connManager:         connManager,
 		channel:             ch,
 		channelMu:           &sync.RWMutex{},
-		reconnectInterval:   reconnectInterval,
+		reconnectInterval:   opts.ReconnectInterval,
+		backoff:             opts.Backoff,
 		reconnectionCount:   0,
 		reconnectionCountMu: &sync.Mutex{},
 		dispatcher:          dispatcher.NewDispatcher(),
+		onChannelLost:       opts.OnChannelLost,
 	}
 	go chanManager.startNotifyCancelOrClosed()
 	return &chanManager, nil
+}
+
+// nextBackoff returns the delay before the given retry attempt (1-based).
+func (chanManager *ChannelManager) nextBackoff(attempt int) time.Duration {
+	if chanManager.backoff != nil {
+		return chanManager.backoff(attempt)
+	}
+	return chanManager.reconnectInterval
 }
 
 func getNewChannel(connManager *connectionmanager.ConnectionManager) (*amqp.Channel, error) {
@@ -89,6 +110,9 @@ func (chanManager *ChannelManager) startNotifyCancelOrClosed() {
 	// exit as "graceful" — leaving a permanent ghost consumer.
 	if ch.IsClosed() {
 		chanManager.logger.Errorf("channel observed closed immediately after reconnect, re-reconnecting")
+		if chanManager.onChannelLost != nil {
+			chanManager.onChannelLost(amqp.ErrClosed)
+		}
 		if loopErr := chanManager.reconnectLoop(); loopErr != nil {
 			return
 		}
@@ -101,6 +125,9 @@ func (chanManager *ChannelManager) startNotifyCancelOrClosed() {
 	case err := <-notifyCloseChan:
 		if err != nil {
 			chanManager.logger.Errorf("attempting to reconnect to amqp server after close with error: %v", err)
+			if chanManager.onChannelLost != nil {
+				chanManager.onChannelLost(err)
+			}
 			if loopErr := chanManager.reconnectLoop(); loopErr != nil {
 				return
 			}
@@ -124,11 +151,15 @@ func (chanManager *ChannelManager) startNotifyCancelOrClosed() {
 		}
 	case err := <-notifyCancelChan:
 		chanManager.logger.Errorf("attempting to reconnect to amqp server after cancel with error: %s", err)
+		cancelErr := errors.New(err)
+		if chanManager.onChannelLost != nil {
+			chanManager.onChannelLost(cancelErr)
+		}
 		if loopErr := chanManager.reconnectLoop(); loopErr != nil {
 			return
 		}
 		chanManager.logger.Warnf("successfully reconnected to amqp server after cancel")
-		chanManager.dispatcher.Dispatch(errors.New(err))
+		chanManager.dispatcher.Dispatch(cancelErr)
 	}
 }
 
@@ -145,31 +176,31 @@ func (chanManager *ChannelManager) incrementReconnectionCount() {
 	chanManager.reconnectionCount++
 }
 
-// reconnectLoop continuously attempts to reconnect. It returns nil on a
-// successful rebuild or errChannelManagerClosed if the manager was closed
-// while the loop was running — callers must not dispatch a reconnect signal
-// in the latter case, since no new channel exists.
+// reconnectLoop continuously attempts to reconnect. Returns nil on success
+// or errChannelManagerClosed when the manager itself or its parent
+// ConnectionManager has been closed — callers must not dispatch a reconnect
+// signal in the latter case, since no new channel exists.
 func (chanManager *ChannelManager) reconnectLoop() error {
-	for {
-		chanManager.logger.Infof("waiting %s seconds to attempt to reconnect to amqp server", chanManager.reconnectInterval)
-		time.Sleep(chanManager.reconnectInterval)
+	for attempt := 1; ; attempt++ {
+		delay := chanManager.nextBackoff(attempt)
+		chanManager.logger.Infof("waiting %s before channel reconnect attempt %d", delay, attempt)
+		time.Sleep(delay)
+
 		err := chanManager.reconnect()
 		if errors.Is(err, errChannelManagerClosed) {
 			chanManager.logger.Infof("channel manager closed, abandoning reconnect loop")
-			// Force-close any dispatcher subscribers so owners blocked on
+			// Force-close dispatcher subscribers so owners blocked on
 			// `for err := range reconnectErrCh` (Consumer.Run,
-			// Publisher recovery goroutine) can exit instead of waiting
-			// forever for a signal that will never come.
+			// Publisher recovery goroutine) can exit cleanly.
 			chanManager.dispatcher.Shutdown()
 			return err
 		}
-		if err != nil {
-			chanManager.logger.Errorf("error reconnecting to amqp server: %v", err)
-			continue
+		if err == nil {
+			chanManager.incrementReconnectionCount()
+			go chanManager.startNotifyCancelOrClosed()
+			return nil
 		}
-		chanManager.incrementReconnectionCount()
-		go chanManager.startNotifyCancelOrClosed()
-		return nil
+		chanManager.logger.Errorf("error reconnecting to amqp server (attempt %d): %v", attempt, err)
 	}
 }
 
